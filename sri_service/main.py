@@ -27,26 +27,26 @@ async def consultar_ruc(ruc: str):
 
     search_ruc = clean_ruc if len(clean_ruc) == 13 else f"{clean_ruc}001"
     
-    # Endpoint principal REST del SRI
-    url_ruc = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={search_ruc}"
+    # Endpoint de datos generales del contribuyente
+    url_ruc = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumeroRuc?numeroRuc={search_ruc}"
     
     async with httpx.AsyncClient(headers=HEADERS, timeout=12.0, verify=False) as client:
         try:
             # 1. Obtener datos del contribuyente
             res_ruc = await client.get(url_ruc)
-            if res_ruc.status_code != 200:
-                logger.warning(f"SRI RUC HTTP status: {res_ruc.status_code}")
-                return {"success": False, "message": f"El SRI no devolvió un código 200 ({res_ruc.status_code})."}
-
-            data_ruc = res_ruc.json()
-            if not data_ruc:
-                return {"success": False, "message": "No se encontraron datos para la identificación ingresada."}
-
-            razon_social = (
-                data_ruc.get("razonSocial") or 
-                data_ruc.get("nombreComercial") or 
-                data_ruc.get("nombreCompleto") or ""
-            ).strip()
+            
+            razon_social = ""
+            if res_ruc.status_code == 200:
+                try:
+                    data_ruc = res_ruc.json()
+                    if isinstance(data_ruc, dict):
+                        razon_social = (
+                            data_ruc.get("razonSocial") or 
+                            data_ruc.get("nombreComercial") or 
+                            data_ruc.get("nombreCompleto") or ""
+                        ).strip()
+                except Exception:
+                    pass
 
             # 2. Consultar establecimientos para obtener la dirección matriz
             url_est = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/Establecimiento/consultarPorNumeroRuc?numeroRuc={search_ruc}"
@@ -57,8 +57,15 @@ async def consultar_ruc(ruc: str):
                 try:
                     establecimientos = res_est.json()
                     if isinstance(establecimientos, list) and len(establecimientos) > 0:
-                        # Buscar establecimiento matriz (tipo MAT) o el primero abierto
                         matriz = next((e for e in establecimientos if e.get("tipoEstablecimiento") == "MAT"), establecimientos[0])
+                        
+                        # Si no obtuvimos la razón social antes, intentar sacarla de aquí
+                        if not razon_social:
+                            razon_social = (
+                                matriz.get("nombreComercial") or 
+                                matriz.get("razonSocial") or ""
+                            ).strip()
+
                         direccion = (
                             matriz.get("direccionCompleta") or 
                             matriz.get("direccion") or 
@@ -67,12 +74,15 @@ async def consultar_ruc(ruc: str):
                 except Exception as e:
                     logger.warning(f"Error parseando establecimientos: {e}")
 
-            return {
-                "success": True,
-                "ruc": search_ruc,
-                "name": razon_social,
-                "street": direccion
-            }
+            if razon_social or direccion:
+                return {
+                    "success": True,
+                    "ruc": search_ruc,
+                    "name": razon_social,
+                    "street": direccion
+                }
+
+            return {"success": False, "message": "No se encontraron datos para la identificación ingresada."}
 
         except httpx.TimeoutException:
             logger.error(f"Timeout llamando a la API del SRI para {search_ruc}")
