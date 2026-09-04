@@ -1,129 +1,82 @@
 import logging
 from fastapi import FastAPI, HTTPException
-from playwright.async_api import async_playwright
+import httpx
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("sri_scraper")
+logger = logging.getLogger("sri_service")
 
-app = FastAPI(title="SRI Ecuador Scraper API")
+app = FastAPI(title="SRI Ecuador Fast API")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Referer": "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc",
+    "Origin": "https://srienlinea.sri.gob.ec"
+}
+
+@app.get("/")
+def home():
+    return {"status": "ok", "service": "SRI Ecuador Lookup API"}
 
 @app.get("/consultar/{ruc}")
 async def consultar_ruc(ruc: str):
     clean_ruc = str(ruc).strip()
     if len(clean_ruc) not in (10, 13):
-        raise HTTPException(status_code=400, detail="Identificación inválida")
+        raise HTTPException(status_code=400, detail="Identificación debe tener 10 o 13 dígitos")
 
     search_ruc = clean_ruc if len(clean_ruc) == 13 else f"{clean_ruc}001"
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-setuid-sandbox", 
-                "--disable-dev-shm-usage",
-                "--blink-settings=imagesEnabled=false"  # No cargar imágenes para acelerar
-            ]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-        
-        # Bloquear recursos pesados (imágenes, fuentes, estilos no esenciales)
-        await page.route("**/*.{png,jpg,jpeg,svg,woff,woff2,css}", lambda route: route.abort())
-
-        captured_data = {}
-
-        async def handle_response(response):
-            if any(k in response.url for k in ["rest", "Obtener", "obtener", "establecimientos"]):
-                try:
-                    data = await response.json()
-                    if isinstance(data, dict):
-                        captured_data.update(data)
-                    elif isinstance(data, list) and len(data) > 0:
-                        captured_data["establecimientos_list"] = data
-                except Exception:
-                    pass
-
-        page.on("response", handle_response)
-
+    # Endpoint principal REST del SRI
+    url_ruc = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={search_ruc}"
+    
+    async with httpx.AsyncClient(headers=HEADERS, timeout=12.0, verify=False) as client:
         try:
-            # Cargar sólo el DOM inicial (mucho más rápido que networkidle)
-            await page.goto(
-                "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc",
-                wait_until="domcontentloaded",
-                timeout=20000
-            )
+            # 1. Obtener datos del contribuyente
+            res_ruc = await client.get(url_ruc)
+            if res_ruc.status_code != 200:
+                logger.warning(f"SRI RUC HTTP status: {res_ruc.status_code}")
+                return {"success": False, "message": f"El SRI no devolvió un código 200 ({res_ruc.status_code})."}
 
-            input_selector = 'input[type="text"], input[name="ruc"]'
-            await page.wait_for_selector(input_selector, timeout=15000)
-            await page.fill(input_selector, search_ruc)
+            data_ruc = res_ruc.json()
+            if not data_ruc:
+                return {"success": False, "message": "No se encontraron datos para la identificación ingresada."}
 
-            btn_selector = 'button:has-text("Consultar")'
-            await page.click(btn_selector)
+            razon_social = (
+                data_ruc.get("razonSocial") or 
+                data_ruc.get("nombreComercial") or 
+                data_ruc.get("nombreCompleto") or ""
+            ).strip()
 
-            # Esperar la respuesta de la API del SRI
-            await page.wait_for_timeout(2500)
-
-            try:
-                btn_est = page.locator('button:has-text("Ver establecimientos"), button:has-text("Mostrar establecimientos")')
-                if await btn_est.count() > 0 and await btn_est.first.is_visible():
-                    await btn_est.first.click()
-                    await page.wait_for_timeout(1500)
-            except Exception:
-                pass
-
-            razon_social = ""
-            try:
-                elem = page.locator('div:has-text("Razón social") + div, .razon-social, h3')
-                if await elem.count() > 0:
-                    razon_social = await elem.first.inner_text()
-            except Exception:
-                pass
-
-            ubicacion_dom = ""
-            try:
-                rows = page.locator('table tr')
-                row_count = await rows.count()
-                for i in range(1, row_count):
-                    row_text = await rows.nth(i).inner_text()
-                    if "ABIERTO" in row_text or i == 1:
-                        cols = rows.nth(i).locator('td')
-                        if await cols.count() >= 3:
-                            ubicacion_dom = await cols.nth(2).inner_text()
-                            break
-            except Exception as e:
-                logger.warning(f"No se pudo extraer dirección del DOM: {str(e)}")
-
-            await browser.close()
-
-            final_name = (
-                captured_data.get("razonSocial") or 
-                captured_data.get("nombreComercial") or 
-                captured_data.get("nombreCompleto") or 
-                razon_social
-            )
-
-            final_street = ubicacion_dom.strip().replace('\n', ' ')
-            if not final_street and "establecimientos_list" in captured_data:
-                est = captured_data["establecimientos_list"][0]
-                final_street = str(est.get("direccionCompleta") or est.get("direccion") or "").strip()
-
-            if not final_street:
-                final_street = str(captured_data.get("direccionMatriz", "")).strip()
-
-            if final_name:
-                return {
-                    "success": True,
-                    "ruc": clean_ruc,
-                    "name": str(final_name).strip().replace('\n', ' '),
-                    "street": final_street,
-                }
+            # 2. Consultar establecimientos para obtener la dirección matriz
+            url_est = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/Establecimiento/consultarPorNumeroRuc?numeroRuc={search_ruc}"
+            res_est = await client.get(url_est)
             
-            return {"success": False, "message": "No se encontraron datos en el SRI."}
+            direccion = ""
+            if res_est.status_code == 200:
+                try:
+                    establecimientos = res_est.json()
+                    if isinstance(establecimientos, list) and len(establecimientos) > 0:
+                        # Buscar establecimiento matriz (tipo MAT) o el primero abierto
+                        matriz = next((e for e in establecimientos if e.get("tipoEstablecimiento") == "MAT"), establecimientos[0])
+                        direccion = (
+                            matriz.get("direccionCompleta") or 
+                            matriz.get("direccion") or 
+                            f"{matriz.get('calle', '')} {matriz.get('numero', '')} {matriz.get('interseccion', '')}"
+                        ).strip()
+                except Exception as e:
+                    logger.warning(f"Error parseando establecimientos: {e}")
 
+            return {
+                "success": True,
+                "ruc": search_ruc,
+                "name": razon_social,
+                "street": direccion
+            }
+
+        except httpx.TimeoutException:
+            logger.error(f"Timeout llamando a la API del SRI para {search_ruc}")
+            return {"success": False, "message": "El servidor del SRI no respondió a tiempo (Timeout)."}
         except Exception as e:
-            await browser.close()
-            logger.error(f"Error procesando RUC {search_ruc}: {str(e)}")
+            logger.error(f"Error en consulta SRI: {str(e)}")
             return {"success": False, "message": f"Error conectando con el SRI: {str(e)}"}
