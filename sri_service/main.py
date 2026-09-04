@@ -10,9 +10,9 @@ app = FastAPI(title="SRI Ecuador Fast API")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Referer": "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc",
-    "Origin": "https://srienlinea.sri.gob.ec"
+    "Accept-Language": "es-ES,es;q=0.9",
+    "Origin": "https://srienlinea.sri.gob.ec",
+    "Referer": "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc"
 }
 
 @app.get("/")
@@ -27,42 +27,44 @@ async def consultar_ruc(ruc: str):
 
     search_ruc = clean_ruc if len(clean_ruc) == 13 else f"{clean_ruc}001"
     
-    url_ruc = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumeroRuc?numeroRuc={search_ruc}"
+    # Endpoints del SRI
+    url_completo = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ContribuyenteCompleto/consultarPorRuc/{search_ruc}"
     url_est = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/Establecimiento/consultarPorNumeroRuc?numeroRuc={search_ruc}"
+    url_consolidado = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumeroRuc?numeroRuc={search_ruc}"
 
     async with httpx.AsyncClient(headers=HEADERS, timeout=12.0, verify=False) as client:
         try:
             razon_social = ""
             direccion = ""
 
-            # 1. Consultar Contribuyente Consolidado
-            res_ruc = await client.get(url_ruc)
-            if res_ruc.status_code == 200:
-                try:
-                    data_ruc = res_ruc.json()
-                    if isinstance(data_ruc, dict):
+            # 1. Intentar con el endpoint de ContribuyenteCompleto (El más fiable para Razón Social)
+            try:
+                res_comp = await client.get(url_completo)
+                if res_comp.status_code == 200:
+                    data_comp = res_comp.json()
+                    if isinstance(data_comp, dict):
                         razon_social = (
-                            data_ruc.get("razonSocial") or 
-                            data_ruc.get("nombreCompleto") or 
-                            data_ruc.get("nombreComercial") or ""
+                            data_comp.get("razonSocial") or 
+                            data_comp.get("nombreComercial") or 
+                            data_comp.get("nombreCompleto") or ""
                         ).strip()
-                except Exception as e:
-                    logger.warning(f"Error parseando datos RUC: {e}")
+            except Exception as e:
+                logger.warning(f"Error en ContribuyenteCompleto: {e}")
 
-            # 2. Consultar Establecimientos
-            res_est = await client.get(url_est)
-            if res_est.status_code == 200:
-                try:
+            # 2. Consultar Establecimientos (para obtener la dirección Matriz y fallback de nombre)
+            try:
+                res_est = await client.get(url_est)
+                if res_est.status_code == 200:
                     establecimientos = res_est.json()
                     if isinstance(establecimientos, list) and len(establecimientos) > 0:
                         matriz = next((e for e in establecimientos if e.get("tipoEstablecimiento") == "MAT"), establecimientos[0])
                         
-                        # Si no obtuvimos la razón social del consolidado, tomarla del establecimiento
+                        # Si no conseguimos la razón social antes, la sacamos del establecimiento
                         if not razon_social:
                             razon_social = (
+                                matriz.get("nombreFantasiaComercial") or 
                                 matriz.get("nombreComercial") or 
-                                matriz.get("razonSocial") or 
-                                matriz.get("denominacion") or ""
+                                matriz.get("razonSocial") or ""
                             ).strip()
 
                         direccion = (
@@ -70,10 +72,23 @@ async def consultar_ruc(ruc: str):
                             matriz.get("direccion") or 
                             f"{matriz.get('calle', '')} {matriz.get('numero', '')} {matriz.get('interseccion', '')}"
                         ).strip()
-                except Exception as e:
-                    logger.warning(f"Error parseando establecimientos: {e}")
+            except Exception as e:
+                logger.warning(f"Error en Establecimientos: {e}")
 
-            # Si se obtuvo al menos razón social o dirección, retornar éxito
+            # 3. Tercer fallback si aún no hay nombre (ConsolidadoContribuyente)
+            if not razon_social:
+                try:
+                    res_cons = await client.get(url_consolidado)
+                    if res_cons.status_code == 200:
+                        data_cons = res_cons.json()
+                        if isinstance(data_cons, dict):
+                            razon_social = (
+                                data_cons.get("razonSocial") or 
+                                data_cons.get("nombreComercial") or ""
+                            ).strip()
+                except Exception as e:
+                    logger.warning(f"Error en ConsolidadoContribuyente: {e}")
+
             if razon_social or direccion:
                 return {
                     "success": True,
