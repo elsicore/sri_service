@@ -1,52 +1,88 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import requests
-from bs4 import BeautifulSoup
 import re
 
-app = FastAPI(title="SRI Web Scraper")
+app = FastAPI(title="SRI Service Ecuador")
 
 @app.get("/consultar/{ruc}")
-def consultar_ruc_web(ruc: str):
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
+def consultar_ruc(ruc: str):
+    ruc = ruc.strip()
+    
+    # Validar que tenga 10 (Cedula) o 13 (RUC) digitos
+    if not re.match(r"^\d{10}(\d{3})?$", ruc):
+        return {
+            "success": False,
+            "ruc": ruc,
+            "name": "",
+            "street": "",
+            "message": "Número de RUC o Cédula no válido"
+        }
 
-    url_pantalla = "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc"
+    # Endpoint oficial de consulta pública del SRI (Catastro Consolidado)
+    url = f"https://sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={ruc}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*"
+    }
 
     try:
-        # Paso 1: Petición GET inicial para obtener el ViewState de JSF y la Cookie
-        res_init = session.get(url_pantalla, timeout=10)
-        soup_init = BeautifulSoup(res_init.text, "html.parser")
+        response = requests.get(url, headers=headers, timeout=8)
         
-        view_state_elem = soup_init.find("input", {"name": "javax.faces.ViewState"})
-        if not view_state_elem:
-            return {"success": False, "message": "No se pudo obtener el ViewState de JSF"}
+        if response.status_code == 200 and response.text.strip():
+            data = response.json()
             
-        view_state = view_state_elem.get("value")
+            if data:
+                # 1. Mapeo jerárquico del Nombre: Razón Social -> Nombre Comercial -> Nombre Completo
+                nombre = (
+                    data.get("razonSocial") or 
+                    data.get("nombreComercial") or 
+                    data.get("nombre") or 
+                    ""
+                ).strip()
 
-        # Paso 2: POST simulando el formulario JSF
-        payload = {
-            "frmConsultaRuc": "frmConsultaRuc",
-            "frmConsultaRuc:txtRuc": ruc.strip(),
-            "frmConsultaRuc:btnConsultar": "",
-            "javax.faces.ViewState": view_state
-        }
+                # 2. Mapeo de la Dirección Matriz / Establecimiento
+                direccion = (
+                    data.get("direccionMatriz") or 
+                    data.get("direccionEstablecimiento") or 
+                    ""
+                ).strip()
 
-        res_post = session.post(url_pantalla, data=payload, timeout=10)
-        soup_result = BeautifulSoup(res_post.text, "html.parser")
+                # Si aún viene sin nombre pero existió en el SRI
+                if not nombre:
+                    # Intento secundario si la API devuelve estructura de persona natural
+                    clase = data.get("claseContribuyente", "")
+                    nombre = f"CONTRIBUYENTE SRI ({clase})" if clase else "CONTRIBUYENTE SRI"
 
-        # Paso 3: Parsear la tabla HTML devuelta por el SRI
-        # (Aquí se extrae la Razón Social y la Matriz de los divs/tablas de PrimeFaces)
-        razon_social_elem = soup_result.find(id="frmConsultaRuc:razonSocial")
-        razon_social = razon_social_elem.text.strip() if razon_social_elem else ""
+                return {
+                    "success": True,
+                    "ruc": ruc,
+                    "name": nombre.upper(),
+                    "street": direccion.upper()
+                }
 
+        # Si el SRI no devuelve datos o status != 200
         return {
-            "success": True if razon_social else False,
+            "success": False,
             "ruc": ruc,
-            "name": razon_social.upper()
+            "name": "",
+            "street": "",
+            "message": "No se encontraron registros en el SRI para la identificación ingresada"
         }
 
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "ruc": ruc,
+            "name": "",
+            "street": "",
+            "message": "Tiempo de espera agotado al conectar con el SRI"
+        }
     except Exception as e:
-        return {"success": False, "message": f"Error parseando JSF: {str(e)}"}
+        return {
+            "success": False,
+            "ruc": ruc,
+            "name": "",
+            "street": "",
+            "message": f"Error en el servicio SRI: {str(e)}"
+        }
