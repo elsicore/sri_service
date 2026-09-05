@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 import requests
+from bs4 import BeautifulSoup
 import re
 
 app = FastAPI(title="SRI Service Ecuador")
@@ -8,7 +9,6 @@ app = FastAPI(title="SRI Service Ecuador")
 def consultar_ruc(ruc: str):
     ruc = ruc.strip()
     
-    # Validar que tenga 10 (Cedula) o 13 (RUC) digitos
     if not re.match(r"^\d{10}(\d{3})?$", ruc):
         return {
             "success": False,
@@ -18,71 +18,66 @@ def consultar_ruc(ruc: str):
             "message": "Número de RUC o Cédula no válido"
         }
 
-    # Endpoint oficial de consulta pública del SRI (Catastro Consolidado)
+    # URL pública de consulta del SRI
     url = f"https://sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={ruc}"
-    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json, text/plain, */*"
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=8)
+        response = requests.get(url, headers=headers, timeout=10)
         
         if response.status_code == 200 and response.text.strip():
             data = response.json()
             
             if data:
-                # 1. Mapeo jerárquico del Nombre: Razón Social -> Nombre Comercial -> Nombre Completo
-                nombre = (
+                # 1. Razón Social estricta (Prioridad a la ficha general)
+                # No tomamos 'nombreComercial' como 'name' principal
+                razon_social = (
                     data.get("razonSocial") or 
-                    data.get("nombreComercial") or 
+                    data.get("nombreCompleto") or 
                     data.get("nombre") or 
                     ""
                 ).strip()
 
-                # 2. Mapeo de la Dirección Matriz / Establecimiento
+                # Sanitizar comillas dobles que rompen la respuesta JSON
+                razon_social = razon_social.replace('"', '').replace("'", "")
+
+                # 2. Nombre Comercial (si existe)
+                nombre_comercial = (data.get("nombreComercial") or "").replace('"', '').strip()
+
+                # 3. Dirección de la Matriz (Establecimiento 001)
                 direccion = (
                     data.get("direccionMatriz") or 
                     data.get("direccionEstablecimiento") or 
                     ""
-                ).strip()
+                ).replace('"', '').strip()
 
-                # Si aún viene sin nombre pero existió en el SRI
-                if not nombre:
-                    # Intento secundario si la API devuelve estructura de persona natural
-                    clase = data.get("claseContribuyente", "")
-                    nombre = f"CONTRIBUYENTE SRI ({clase})" if clase else "CONTRIBUYENTE SRI"
+                # Fallback en caso de que razón social venga vacía
+                final_name = razon_social if razon_social else nombre_comercial
 
                 return {
                     "success": True,
                     "ruc": ruc,
-                    "name": nombre.upper(),
+                    "name": final_name.upper(),
+                    "commercial_name": nombre_comercial.upper(),
                     "street": direccion.upper()
                 }
 
-        # Si el SRI no devuelve datos o status != 200
         return {
             "success": False,
             "ruc": ruc,
             "name": "",
             "street": "",
-            "message": "No se encontraron registros en el SRI para la identificación ingresada"
+            "message": "No se encontraron registros en el SRI"
         }
 
-    except requests.exceptions.Timeout:
-        return {
-            "success": False,
-            "ruc": ruc,
-            "name": "",
-            "street": "",
-            "message": "Tiempo de espera agotado al conectar con el SRI"
-        }
     except Exception as e:
         return {
             "success": False,
             "ruc": ruc,
             "name": "",
             "street": "",
-            "message": f"Error en el servicio SRI: {str(e)}"
+            "message": f"Error en la consulta: {str(e)}"
         }
