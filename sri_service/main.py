@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 import requests
-from bs4 import BeautifulSoup
 import re
 
 app = FastAPI(title="SRI Service Ecuador")
@@ -18,11 +17,12 @@ def consultar_ruc(ruc: str):
             "message": "Número de RUC o Cédula no válido"
         }
 
-    # URL pública de consulta del SRI
-    url = f"https://sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={ruc}"
+    # API REST interna usada por la pantalla de srienlinea
+    url = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={ruc}"
+    
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "application/json, text/plain, */*"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
     }
 
     try:
@@ -32,29 +32,26 @@ def consultar_ruc(ruc: str):
             data = response.json()
             
             if data:
-                # 1. Razón Social estricta (Prioridad a la ficha general)
-                # No tomamos 'nombreComercial' como 'name' principal
+                # 1. Razón Social principal (Ficha General)
                 razon_social = (
                     data.get("razonSocial") or 
                     data.get("nombreCompleto") or 
-                    data.get("nombre") or 
                     ""
-                ).strip()
+                ).replace('"', '').replace("'", "").strip()
 
-                # Sanitizar comillas dobles que rompen la respuesta JSON
-                razon_social = razon_social.replace('"', '').replace("'", "")
+                # 2. Nombre Comercial (Establecimiento)
+                nombre_comercial = (
+                    data.get("nombreComercial") or ""
+                ).replace('"', '').replace("'", "").strip()
 
-                # 2. Nombre Comercial (si existe)
-                nombre_comercial = (data.get("nombreComercial") or "").replace('"', '').strip()
-
-                # 3. Dirección de la Matriz (Establecimiento 001)
+                # 3. Dirección Matriz
                 direccion = (
                     data.get("direccionMatriz") or 
                     data.get("direccionEstablecimiento") or 
                     ""
-                ).replace('"', '').strip()
+                ).replace('"', '').replace("'", "").strip()
 
-                # Fallback en caso de que razón social venga vacía
+                # Garantizar que name NUNCA tome el nombre comercial si existe Razón Social
                 final_name = razon_social if razon_social else nombre_comercial
 
                 return {
@@ -70,7 +67,7 @@ def consultar_ruc(ruc: str):
             "ruc": ruc,
             "name": "",
             "street": "",
-            "message": "No se encontraron registros en el SRI"
+            "message": "No se encontraron registros en el SRI para esta identificación."
         }
 
     except Exception as e:
@@ -79,5 +76,5 @@ def consultar_ruc(ruc: str):
             "ruc": ruc,
             "name": "",
             "street": "",
-            "message": f"Error en la consulta: {str(e)}"
+            "message": f"Error al consultar el SRI: {str(e)}"
         }
