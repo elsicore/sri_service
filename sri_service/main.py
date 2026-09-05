@@ -8,7 +8,7 @@ app = FastAPI(title="SRI Service Ecuador")
 def consultar_ruc(ruc: str):
     ruc = ruc.strip()
     
-    # Validar formato: Cédula (10 dígitos) o RUC (13 dígitos)
+    # Validar que tenga 10 (Cédula) o 13 (RUC) dígitos
     if not re.match(r"^\d{10}(\d{3})?$", ruc):
         return {
             "success": False,
@@ -18,8 +18,8 @@ def consultar_ruc(ruc: str):
             "message": "Número de RUC o Cédula no válido"
         }
 
-    # Endpoint oficial del catastro en srienlinea
-    url = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumerosRuc?numeroRuc={ruc}"
+    # Endpoint plural usando el parámetro plural 'numeroRucs'
+    url = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumerosRuc?numeroRucs={ruc}"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -28,12 +28,12 @@ def consultar_ruc(ruc: str):
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=12)
         
         if response.status_code == 200 and response.text.strip():
             raw_data = response.json()
             
-            # Desempaquetar lista si viene con elementos
+            # Desempaquetar lista
             data = None
             if isinstance(raw_data, list) and len(raw_data) > 0:
                 data = raw_data[0]
@@ -41,33 +41,36 @@ def consultar_ruc(ruc: str):
                 data = raw_data
 
             if data and isinstance(data, dict):
-                # Extraer y sanitizar comillas de la Razón Social / Nombre Completo
-                nombre = (
+                # 1. Razón Social principal (Prioridad)
+                razon_social = (
                     data.get("razonSocial") or 
-                    data.get("nombreComercial") or 
-                    data.get("nombre") or 
+                    data.get("nombreCompleto") or 
                     ""
                 ).replace('"', '').replace("'", "").strip()
 
-                # Extraer y sanitizar la dirección
+                # 2. Nombre Comercial
+                nombre_comercial = (
+                    data.get("nombreComercial") or ""
+                ).replace('"', '').replace("'", "").strip()
+
+                # 3. Dirección Matriz
                 direccion = (
                     data.get("direccionMatriz") or 
                     data.get("direccionEstablecimiento") or 
                     ""
                 ).replace('"', '').replace("'", "").strip()
 
-                if not nombre:
-                    clase = data.get("claseContribuyente", "")
-                    nombre = f"CONTRIBUYENTE SRI ({clase})" if clase else "CONTRIBUYENTE SRI"
+                final_name = razon_social if razon_social else nombre_comercial
 
-                return {
-                    "success": True,
-                    "ruc": ruc,
-                    "name": nombre.upper(),
-                    "street": direccion.upper()
-                }
+                if final_name:
+                    return {
+                        "success": True,
+                        "ruc": ruc,
+                        "name": final_name.upper(),
+                        "commercial_name": nombre_comercial.upper(),
+                        "street": direccion.upper()
+                    }
 
-        # Si el SRI respondió pero la lista vino vacía o con estatus diferente a 200
         return {
             "success": False,
             "ruc": ruc,
