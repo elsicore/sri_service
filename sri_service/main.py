@@ -1,6 +1,6 @@
 import logging
 from fastapi import FastAPI, HTTPException
-import httpx
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sri_service")
