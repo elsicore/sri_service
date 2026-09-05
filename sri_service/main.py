@@ -1,6 +1,5 @@
 import logging
 from fastapi import FastAPI, HTTPException
-from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sri_scraper")
