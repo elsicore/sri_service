@@ -1,14 +1,15 @@
 from fastapi import FastAPI
 import requests
+from bs4 import BeautifulSoup
 import re
 
-app = FastAPI(title="SRI Service Ecuador")
+app = FastAPI(title="SRI Web Scraper Service")
 
 @app.get("/consultar/{ruc}")
 def consultar_ruc(ruc: str):
     ruc = ruc.strip()
     
-    # Validar que tenga 10 (Cédula) o 13 (RUC) dígitos
+    # Validar formato Cédula / RUC
     if not re.match(r"^\d{10}(\d{3})?$", ruc):
         return {
             "success": False,
@@ -18,65 +19,92 @@ def consultar_ruc(ruc: str):
             "message": "Número de RUC o Cédula no válido"
         }
 
-    # Endpoint plural usando el parámetro plural 'numeroRucs'
-    url = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumerosRuc?numeroRucs={ruc}"
-    
-    headers = {
+    url_web = "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc"
+
+    session = requests.Session()
+    session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://srienlinea.sri.gob.ec/"
-    }
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9",
+    })
 
     try:
-        response = requests.get(url, headers=headers, timeout=12)
+        # Paso 1: Petición GET para iniciar la sesión JSF y obtener javax.faces.ViewState
+        res_get = session.get(url_web, timeout=12)
+        if res_get.status_code != 200:
+            return {
+                "success": False,
+                "ruc": ruc,
+                "name": "",
+                "street": "",
+                "message": f"Error conectando con la vista del SRI (HTTP {res_get.status_code})"
+            }
+
+        soup_get = BeautifulSoup(res_get.text, "html.parser")
+        view_state_input = soup_get.find("input", {"name": "javax.faces.ViewState"})
+
+        if not view_state_input or not view_state_input.get("value"):
+            return {
+                "success": False,
+                "ruc": ruc,
+                "name": "",
+                "street": "",
+                "message": "No se pudo obtener el token ViewState de JSF."
+            }
+
+        view_state = view_state_input["value"]
+
+        # Paso 2: Petición POST simulando la acción del botón "Consultar"
+        payload = {
+            "frmConsultaRuc": "frmConsultaRuc",
+            "frmConsultaRuc:txtRuc": ruc,
+            "frmConsultaRuc:btnConsultar": "",
+            "javax.faces.ViewState": view_state
+        }
+
+        res_post = session.post(url_web, data=payload, timeout=15)
+        soup_post = BeautifulSoup(res_post.text, "html.parser")
+
+        # Paso 3: Extraer la información desde los componentes JSF/PrimeFaces
+        # Intentar buscar por IDs directos de PrimeFaces o clases del HTML devuelto
+        razon_social_elem = (
+            soup_post.find(id=re.compile(r".*razonSocial.*")) or
+            soup_post.find("span", class_="ui-outputtext")
+        )
         
-        if response.status_code == 200 and response.text.strip():
-            raw_data = response.json()
-            
-            # Desempaquetar lista
-            data = None
-            if isinstance(raw_data, list) and len(raw_data) > 0:
-                data = raw_data[0]
-            elif isinstance(raw_data, dict):
-                data = raw_data
+        # Buscar en celdas/tablas de la vista si no está en un ID directo
+        nombre = ""
+        direccion = ""
 
-            if data and isinstance(data, dict):
-                # 1. Razón Social principal (Prioridad)
-                razon_social = (
-                    data.get("razonSocial") or 
-                    data.get("nombreCompleto") or 
-                    ""
-                ).replace('"', '').replace("'", "").strip()
+        # Recorremos los elementos de texto en la vista
+        textos = [elem.get_text(strip=True) for elem in soup_post.find_all(["td", "span", "label"])]
+        
+        for i, texto in enumerate(textos):
+            if "Razón Social" in texto or "Nombres" in texto:
+                if i + 1 < len(textos):
+                    nombre = textos[i + 1]
+            if "Dirección" in texto or "Matriz" in texto:
+                if i + 1 < len(textos):
+                    direccion = textos[i + 1]
 
-                # 2. Nombre Comercial
-                nombre_comercial = (
-                    data.get("nombreComercial") or ""
-                ).replace('"', '').replace("'", "").strip()
+        # Sanitizar valores
+        nombre = nombre.replace('"', '').replace("'", "").strip()
+        direccion = direccion.replace('"', '').replace("'", "").strip()
 
-                # 3. Dirección Matriz
-                direccion = (
-                    data.get("direccionMatriz") or 
-                    data.get("direccionEstablecimiento") or 
-                    ""
-                ).replace('"', '').replace("'", "").strip()
-
-                final_name = razon_social if razon_social else nombre_comercial
-
-                if final_name:
-                    return {
-                        "success": True,
-                        "ruc": ruc,
-                        "name": final_name.upper(),
-                        "commercial_name": nombre_comercial.upper(),
-                        "street": direccion.upper()
-                    }
+        if nombre and nombre.upper() != "Razón Social".upper():
+            return {
+                "success": True,
+                "ruc": ruc,
+                "name": nombre.upper(),
+                "street": direccion.upper()
+            }
 
         return {
             "success": False,
             "ruc": ruc,
             "name": "",
             "street": "",
-            "message": "No se encontraron registros en el SRI para esta identificación."
+            "message": "El RUC consultado no devolvió datos en la pantalla del SRI."
         }
 
     except requests.exceptions.Timeout:
@@ -85,7 +113,7 @@ def consultar_ruc(ruc: str):
             "ruc": ruc,
             "name": "",
             "street": "",
-            "message": "Tiempo de espera agotado al conectar con el SRI"
+            "message": "Tiempo de espera agotado al consultar la web del SRI."
         }
     except Exception as e:
         return {
@@ -93,5 +121,5 @@ def consultar_ruc(ruc: str):
             "ruc": ruc,
             "name": "",
             "street": "",
-            "message": f"Error en el servicio SRI: {str(e)}"
+            "message": f"Error al procesar la vista web del SRI: {str(e)}"
         }
