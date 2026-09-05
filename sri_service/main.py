@@ -28,12 +28,12 @@ def consultar_ruc(ruc: str):
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=8)
+        # Aumentamos el timeout a 20 segundos
+        response = requests.get(url, headers=headers, timeout=20)
         
         if response.status_code == 200 and response.text.strip():
             raw_data = response.json()
             
-            # El SRI devuelve una lista de objetos: extraemos la primera posición
             if isinstance(raw_data, list) and len(raw_data) > 0:
                 data = raw_data[0]
             elif isinstance(raw_data, dict):
@@ -42,8 +42,6 @@ def consultar_ruc(ruc: str):
                 data = None
             
             if data and isinstance(data, dict):
-                # 1. Mapeo jerárquico del Nombre (Priorizando Razón Social sobre Comercial)
-                # Se eliminan comillas dobles y simples para no romper el cliente de Odoo
                 nombre = (
                     data.get("razonSocial") or 
                     data.get("nombreComercial") or 
@@ -51,14 +49,12 @@ def consultar_ruc(ruc: str):
                     ""
                 ).replace('"', '').replace("'", "").strip()
 
-                # 2. Mapeo de la Dirección Matriz / Establecimiento
                 direccion = (
                     data.get("direccionMatriz") or 
                     data.get("direccionEstablecimiento") or 
                     ""
                 ).replace('"', '').replace("'", "").strip()
 
-                # Si aún viene sin nombre pero existió en el SRI
                 if not nombre:
                     clase = data.get("claseContribuyente", "")
                     nombre = f"CONTRIBUYENTE SRI ({clase})" if clase else "CONTRIBUYENTE SRI"
@@ -68,16 +64,7 @@ def consultar_ruc(ruc: str):
                     "ruc": ruc,
                     "name": nombre.upper(),
                     "street": direccion.upper()
-                }
-
-        # Si el SRI no devuelve datos o status != 200
-        return {
-            "success": False,
-            "ruc": ruc,
-            "name": "",
-            "street": "",
-            "message": "No se encontraron registros en el SRI para la identificación ingresada"
-        }
+    }
 
     except requests.exceptions.Timeout:
         return {
