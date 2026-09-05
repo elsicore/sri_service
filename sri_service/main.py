@@ -1,5 +1,6 @@
 import logging
 from fastapi import FastAPI, HTTPException
+from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sri_scraper")
@@ -21,7 +22,7 @@ async def consultar_ruc(ruc: str):
                 "--no-sandbox", 
                 "--disable-setuid-sandbox", 
                 "--disable-dev-shm-usage",
-                "--blink-settings=imagesEnabled=false"  # No cargar imágenes para acelerar
+                "--blink-settings=imagesEnabled=false"
             ]
         )
         context = await browser.new_context(
@@ -29,8 +30,8 @@ async def consultar_ruc(ruc: str):
         )
         page = await context.new_page()
         
-        # Bloquear recursos pesados (imágenes, fuentes, estilos no esenciales)
-        await page.route("**/*.{png,jpg,jpeg,svg,woff,woff2,css}", lambda route: route.abort())
+        # Bloquear solo imágenes y fuentes para no romper la maquetación CSS/JS
+        await page.route("**/*.{png,jpg,jpeg,svg,woff,woff2}", lambda route: route.abort())
 
         captured_data = {}
 
@@ -48,34 +49,26 @@ async def consultar_ruc(ruc: str):
         page.on("response", handle_response)
 
         try:
-            # Cargar sólo el DOM inicial (mucho más rápido que networkidle)
             await page.goto(
                 "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc",
                 wait_until="domcontentloaded",
-                timeout=20000
+                timeout=25000
             )
 
-            input_selector = 'input[type="text"], input[name="ruc"]'
+            # Esperar a que cargue el campo de texto del RUC
+            input_selector = 'input[id*="txtRuc"], input[type="text"]'
             await page.wait_for_selector(input_selector, timeout=15000)
             await page.fill(input_selector, search_ruc)
 
-            btn_selector = 'button:has-text("Consultar")'
-            await page.click(btn_selector)
+            # Simular presionar Enter para disparar la consulta en JSF
+            await page.keyboard.press("Enter")
 
-            # Esperar la respuesta de la API del SRI
-            await page.wait_for_timeout(2500)
-
-            try:
-                btn_est = page.locator('button:has-text("Ver establecimientos"), button:has-text("Mostrar establecimientos")')
-                if await btn_est.count() > 0 and await btn_est.first.is_visible():
-                    await btn_est.first.click()
-                    await page.wait_for_timeout(1500)
-            except Exception:
-                pass
+            # Esperar a que la petición a la API responda
+            await page.wait_for_timeout(3500)
 
             razon_social = ""
             try:
-                elem = page.locator('div:has-text("Razón social") + div, .razon-social, h3')
+                elem = page.locator('.ui-outputlabel, .razon-social, h3')
                 if await elem.count() > 0:
                     razon_social = await elem.first.inner_text()
             except Exception:
