@@ -17,8 +17,8 @@ def consultar_ruc(ruc: str):
             "message": "Número de RUC o Cédula no válido"
         }
 
-    # API REST interna usada por la pantalla de srienlinea
-    url = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={ruc}"
+    # Endpoint correcto que retorna el DTO completo del contribuyente
+    url = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumeroRuc?numeroRuc={ruc}"
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -31,36 +31,34 @@ def consultar_ruc(ruc: str):
         if response.status_code == 200 and response.text.strip():
             data = response.json()
             
-            if data:
-                # 1. Razón Social principal (Ficha General)
+            # Verificamos que sea un diccionario y no un booleano ni un valor nulo
+            if isinstance(data, dict):
                 razon_social = (
                     data.get("razonSocial") or 
                     data.get("nombreCompleto") or 
                     ""
                 ).replace('"', '').replace("'", "").strip()
 
-                # 2. Nombre Comercial (Establecimiento)
                 nombre_comercial = (
                     data.get("nombreComercial") or ""
                 ).replace('"', '').replace("'", "").strip()
 
-                # 3. Dirección Matriz
                 direccion = (
                     data.get("direccionMatriz") or 
                     data.get("direccionEstablecimiento") or 
                     ""
                 ).replace('"', '').replace("'", "").strip()
 
-                # Garantizar que name NUNCA tome el nombre comercial si existe Razón Social
                 final_name = razon_social if razon_social else nombre_comercial
 
-                return {
-                    "success": True,
-                    "ruc": ruc,
-                    "name": final_name.upper(),
-                    "commercial_name": nombre_comercial.upper(),
-                    "street": direccion.upper()
-                }
+                if final_name:
+                    return {
+                        "success": True,
+                        "ruc": ruc,
+                        "name": final_name.upper(),
+                        "commercial_name": nombre_comercial.upper(),
+                        "street": direccion.upper()
+                    }
 
         return {
             "success": False,
