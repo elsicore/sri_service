@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 import requests
 import re
 
@@ -8,7 +8,7 @@ app = FastAPI(title="SRI Service Ecuador")
 def consultar_ruc(ruc: str):
     ruc = ruc.strip()
     
-    # Validar que tenga 10 (Cédula) o 13 (RUC) dígitos
+    # Validar formato: Cédula (10 dígitos) o RUC (13 dígitos)
     if not re.match(r"^\d{10}(\d{3})?$", ruc):
         return {
             "success": False,
@@ -18,7 +18,7 @@ def consultar_ruc(ruc: str):
             "message": "Número de RUC o Cédula no válido"
         }
 
-    # Endpoint oficial activo del SRI en Línea (con subdominio srienlinea)
+    # Endpoint oficial del catastro en srienlinea
     url = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/obtenerPorNumerosRuc?numeroRuc={ruc}"
     
     headers = {
@@ -28,20 +28,20 @@ def consultar_ruc(ruc: str):
     }
 
     try:
-        # Aumentamos el timeout a 20 segundos
-        response = requests.get(url, headers=headers, timeout=20)
+        response = requests.get(url, headers=headers, timeout=15)
         
         if response.status_code == 200 and response.text.strip():
             raw_data = response.json()
             
+            # Desempaquetar lista si viene con elementos
+            data = None
             if isinstance(raw_data, list) and len(raw_data) > 0:
                 data = raw_data[0]
             elif isinstance(raw_data, dict):
                 data = raw_data
-            else:
-                data = None
-            
+
             if data and isinstance(data, dict):
+                # Extraer y sanitizar comillas de la Razón Social / Nombre Completo
                 nombre = (
                     data.get("razonSocial") or 
                     data.get("nombreComercial") or 
@@ -49,6 +49,7 @@ def consultar_ruc(ruc: str):
                     ""
                 ).replace('"', '').replace("'", "").strip()
 
+                # Extraer y sanitizar la dirección
                 direccion = (
                     data.get("direccionMatriz") or 
                     data.get("direccionEstablecimiento") or 
@@ -64,7 +65,16 @@ def consultar_ruc(ruc: str):
                     "ruc": ruc,
                     "name": nombre.upper(),
                     "street": direccion.upper()
-    }
+                }
+
+        # Si el SRI respondió pero la lista vino vacía o con estatus diferente a 200
+        return {
+            "success": False,
+            "ruc": ruc,
+            "name": "",
+            "street": "",
+            "message": "No se encontraron registros en el SRI para esta identificación."
+        }
 
     except requests.exceptions.Timeout:
         return {
