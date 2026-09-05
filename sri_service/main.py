@@ -8,7 +8,7 @@ logger = logging.getLogger("sri_scraper")
 app = FastAPI(title="SRI Ecuador API")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "es-ES,es;q=0.9",
     "Origin": "https://srienlinea.sri.gob.ec",
@@ -27,21 +27,38 @@ def consultar_ruc(ruc: str):
     session.headers.update(HEADERS)
 
     try:
-        # 1. Consultar Datos del Contribuyente
-        url_contribuyente = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={search_ruc}"
-        resp_contrib = session.get(url_contribuyente, timeout=10)
+        # 1. Warm-up: Obtener cookies de sesión del SRI para evitar bloqueo 403 / respuesta vacía
+        try:
+            session.get(
+                "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc",
+                timeout=5
+            )
+        except Exception:
+            pass
+
+        # 2. Consultar la API de Contribuyente
+        url_contrib = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={search_ruc}"
+        resp_contrib = session.get(url_contrib, timeout=10)
 
         name = ""
         if resp_contrib.status_code == 200:
-            data_contrib = resp_contrib.json()
-            if isinstance(data_contrib, dict):
+            data = resp_contrib.json()
+            if isinstance(data, dict):
                 name = (
-                    data_contrib.get("razonSocial") or 
-                    data_contrib.get("nombreCompleto") or 
-                    data_contrib.get("nombreComercial") or ""
+                    data.get("razonSocial") or 
+                    data.get("nombreCompleto") or 
+                    data.get("nombreComercial") or ""
                 )
+            elif isinstance(data, list) and len(data) > 0:
+                first = data[0]
+                if isinstance(first, dict):
+                    name = (
+                        first.get("razonSocial") or 
+                        first.get("nombreCompleto") or 
+                        first.get("nombreComercial") or ""
+                    )
 
-        # 2. Consultar Establecimientos para obtener la Dirección
+        # 3. Consultar Establecimientos para extraer Dirección
         url_est = f"https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest/Establecimiento/consultarPorNumeroRuc?numeroRuc={search_ruc}"
         resp_est = session.get(url_est, timeout=10)
 
@@ -49,33 +66,41 @@ def consultar_ruc(ruc: str):
         if resp_est.status_code == 200:
             data_est = resp_est.json()
             if isinstance(data_est, list) and len(data_est) > 0:
-                # Buscar el establecimiento matriz o el primero abierto
-                matriz = next((e for e in data_est if e.get("tipoEstablecimiento") == "MAT" or e.get("estado") == "ABI"), data_est[0])
+                # Priorizar establecimiento Matriz o Abierto
+                matriz = next(
+                    (e for e in data_est if e.get("tipoEstablecimiento") == "MAT" or e.get("estado") == "ABI"),
+                    data_est[0]
+                )
                 
-                direccion_parts = [
-                    matriz.get("provincia"),
-                    matriz.get("canton"),
-                    matriz.get("parroquia"),
-                    matriz.get("calle"),
-                    matriz.get("numero"),
-                    matriz.get("interseccion")
-                ]
-                # Filtrar valores nulos y concatenar
-                street = " / ".join([str(p).strip() for p in direccion_parts if p and str(p).strip() != "None"])
+                # Si no obtuvimos el nombre arriba, intentar sacarlo del nombre comercial del establecimiento
+                if not name and matriz.get("nombreComercial"):
+                    name = matriz.get("nombreComercial")
+
+                # Armar dirección limpia
+                prov = matriz.get("provincia") or ""
+                cant = matriz.get("canton") or ""
+                parr = matriz.get("parroquia") or ""
+                calle = matriz.get("calle") or ""
+                num = matriz.get("numero") or ""
+                inter = matriz.get("interseccion") or ""
+
+                parts = [p.strip() for p in [prov, cant, parr, calle, num, inter] if p and str(p).strip().upper() not in ("NONE", "NULL")]
+                street = " / ".join(parts)
+
                 if not street:
                     street = str(matriz.get("direccionCompleta") or matriz.get("direccion") or "").strip()
 
         if name:
             return {
                 "success": True,
-                "ruc": clean_ruc,
+                "ruc": search_ruc,
                 "name": str(name).strip(),
                 "street": str(street).strip()
             }
 
         return {
             "success": False,
-            "ruc": clean_ruc,
+            "ruc": search_ruc,
             "name": "",
             "street": "",
             "message": "No se encontraron registros para el RUC ingresado."
@@ -85,7 +110,7 @@ def consultar_ruc(ruc: str):
         logger.error(f"Error consultando SRI API: {str(e)}")
         return {
             "success": False,
-            "ruc": clean_ruc,
+            "ruc": search_ruc,
             "name": "",
             "street": "",
             "message": f"Error de conexión con el SRI: {str(e)}"
