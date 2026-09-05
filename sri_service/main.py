@@ -30,7 +30,7 @@ async def consultar_ruc(ruc: str):
         )
         page = await context.new_page()
         
-        # Bloquear solo imágenes y fuentes para no romper la maquetación CSS/JS
+        # Bloquear solo imágenes y fuentes
         await page.route("**/*.{png,jpg,jpeg,svg,woff,woff2}", lambda route: route.abort())
 
         captured_data = {}
@@ -55,34 +55,64 @@ async def consultar_ruc(ruc: str):
                 timeout=25000
             )
 
-            # Esperar a que cargue el campo de texto del RUC
+            # 1. Llenar campo RUC
             input_selector = 'input[id*="txtRuc"], input[type="text"]'
             await page.wait_for_selector(input_selector, timeout=15000)
             await page.fill(input_selector, search_ruc)
 
-            # Simular presionar Enter para disparar la consulta en JSF
-            await page.keyboard.press("Enter")
+            # 2. Hacer clic en Consultar
+            btn_consultar = page.locator('button:has-text("Consultar"), input[value="Consultar"]')
+            if await btn_consultar.count() > 0:
+                await btn_consultar.first.click()
+            else:
+                await page.keyboard.press("Enter")
 
-            # Esperar a que la petición a la API responda
-            await page.wait_for_timeout(3500)
+            # Esperar a que cargue la información
+            await page.wait_for_timeout(3000)
 
+            # 3. Extraer Nombre / Razón Social real
             razon_social = ""
-            try:
-                elem = page.locator('.ui-outputlabel, .razon-social, h3')
-                if await elem.count() > 0:
-                    razon_social = await elem.first.inner_text()
-            except Exception:
-                pass
+            # Intentar primero desde respuestas JSON de red
+            razon_social = (
+                captured_data.get("razonSocial") or 
+                captured_data.get("nombreCompleto") or 
+                captured_data.get("nombreComercial") or ""
+            )
 
+            # Si no vino en red, extraer del DOM filtrando textos estáticos de la interfaz
+            if not razon_social:
+                labels = page.locator('span, div, label')
+                count = await labels.count()
+                for i in range(count):
+                    txt = await labels.nth(i).inner_text()
+                    txt_clean = txt.strip()
+                    if "RAZON SOCIAL" in txt_clean.upper() or "NOMBRES" in txt_clean.upper():
+                        # Obtener el valor contiguo o siguiente
+                        if i + 1 < count:
+                            val = await labels.nth(i + 1).inner_text()
+                            if val and "CONSULTAR" not in val.upper() and len(val) > 3:
+                                razon_social = val
+                                break
+
+            # 4. Desplegar la tabla de establecimientos si no está visible
+            btn_est = page.locator('button:has-text("Ver establecimientos"), button:has-text("Mostrar establecimientos")')
+            if await btn_est.count() > 0 and await btn_est.first.is_visible():
+                await btn_est.first.click()
+                await page.wait_for_timeout(2000)
+
+            # 5. Extraer Dirección desde la tabla "Ubicación de establecimiento"
             ubicacion_dom = ""
             try:
+                # Selector enfocado en la tabla de establecimientos visible en tu imagen
                 rows = page.locator('table tr')
                 row_count = await rows.count()
-                for i in range(1, row_count):
+                for i in range(row_count):
                     row_text = await rows.nth(i).inner_text()
-                    if "ABIERTO" in row_text or i == 1:
+                    if "ABIERTO" in row_text.upper():
                         cols = rows.nth(i).locator('td')
-                        if await cols.count() >= 3:
+                        col_count = await cols.count()
+                        if col_count >= 3:
+                            # La columna 3 (índice 2) contiene la ubicación
                             ubicacion_dom = await cols.nth(2).inner_text()
                             break
             except Exception as e:
@@ -90,13 +120,9 @@ async def consultar_ruc(ruc: str):
 
             await browser.close()
 
-            final_name = (
-                captured_data.get("razonSocial") or 
-                captured_data.get("nombreComercial") or 
-                captured_data.get("nombreCompleto") or 
-                razon_social
-            )
-
+            # Sanitización de variables finales
+            final_name = str(razon_social).strip().replace('\n', ' ')
+            
             final_street = ubicacion_dom.strip().replace('\n', ' ')
             if not final_street and "establecimientos_list" in captured_data:
                 est = captured_data["establecimientos_list"][0]
@@ -105,17 +131,29 @@ async def consultar_ruc(ruc: str):
             if not final_street:
                 final_street = str(captured_data.get("direccionMatriz", "")).strip()
 
-            if final_name:
+            if final_name and final_name.upper() != "CONSULTAR INFORMACIÓN DEL CONTRIBUYENTE":
                 return {
                     "success": True,
                     "ruc": clean_ruc,
-                    "name": str(final_name).strip().replace('\n', ' '),
-                    "street": final_street,
+                    "name": final_name,
+                    "street": final_street
                 }
             
-            return {"success": False, "message": "No se encontraron datos en el SRI."}
+            return {
+                "success": False, 
+                "ruc": clean_ruc,
+                "name": "",
+                "street": "",
+                "message": "No se pudieron obtener los datos completos del contribuyente."
+            }
 
         except Exception as e:
             await browser.close()
             logger.error(f"Error procesando RUC {search_ruc}: {str(e)}")
-            return {"success": False, "message": f"Error conectando con el SRI: {str(e)}"}
+            return {
+                "success": False, 
+                "ruc": clean_ruc,
+                "name": "",
+                "street": "",
+                "message": f"Error conectando con el SRI: {str(e)}"
+            }
