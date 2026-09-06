@@ -1,6 +1,6 @@
+import asyncio
 import logging
 import httpx
-from functools import lru_cache
 from fastapi import FastAPI, HTTPException
 
 logging.basicConfig(level=logging.INFO)
@@ -8,7 +8,6 @@ logger = logging.getLogger("sri_service")
 
 app = FastAPI(title="SRI Ecuador Fast API")
 
-# Headers para simular una petición legítima de navegador
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -18,11 +17,6 @@ HEADERS = {
 
 SRI_BASE_URL = "https://srienlinea.sri.gob.ec/sri-catastro-sujeto-pasivo-servicio-internet/rest"
 
-# Cache en memoria para respuestas instantáneas (últimas 1024 consultas)
-@lru_cache(maxsize=1024)
-def _get_cached_data(ruc: str):
-    return None
-
 @app.get("/consultar/{ruc}")
 async def consultar_ruc(ruc: str):
     clean_ruc = str(ruc).strip()
@@ -31,14 +25,13 @@ async def consultar_ruc(ruc: str):
 
     search_ruc = clean_ruc if len(clean_ruc) == 13 else f"{clean_ruc}001"
 
-    # 1. Consultar de las REST APIs del SRI directamente en paralelo
     url_contribuyente = f"{SRI_BASE_URL}/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={search_ruc}"
     url_establecimiento = f"{SRI_BASE_URL}/Establecimiento/consultarPorNumeroRuc?numeroRuc={search_ruc}"
 
     async with httpx.AsyncClient(headers=HEADERS, timeout=8.0, verify=False) as client:
         try:
-            # Ejecutar ambas peticiones en paralelo
-            res_contrib, res_estab = await httpx.gather(
+            # Uso correcto de asyncio.gather para concurrencia
+            res_contrib, res_estab = await asyncio.gather(
                 client.get(url_contribuyente),
                 client.get(url_establecimiento),
                 return_exceptions=True
@@ -47,7 +40,7 @@ async def consultar_ruc(ruc: str):
             name = ""
             street = ""
 
-            # Procesar datos del contribuyente (Razón Social / Nombre)
+            # 1. Procesar Razón Social / Nombre
             if isinstance(res_contrib, httpx.Response) and res_contrib.status_code == 200:
                 data_c = res_contrib.json()
                 if isinstance(data_c, list) and len(data_c) > 0:
@@ -59,14 +52,13 @@ async def consultar_ruc(ruc: str):
                         data_c.get("nombreComercial") or ""
                     ).strip()
 
-            # Procesar datos de establecimientos (Dirección Matriz / Casa Matriz)
+            # 2. Procesar Dirección Matriz
             if isinstance(res_estab, httpx.Response) and res_estab.status_code == 200:
                 data_e = res_estab.json()
                 est_list = data_e if isinstance(data_e, list) else [data_e]
 
                 for est in est_list:
                     if isinstance(est, dict):
-                        # Priorizar Matriz
                         prov = est.get("provincia") or ""
                         cant = est.get("canton") or ""
                         parr = est.get("parroquia") or ""
