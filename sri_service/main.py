@@ -17,7 +17,6 @@ async def consultar_ruc(ruc: str):
     search_ruc = clean_ruc if len(clean_ruc) == 13 else f"{clean_ruc}001"
 
     async with async_playwright() as p:
-        # Lanzar Chromium con configuraciones que eviten bloqueos en Render
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -35,54 +34,108 @@ async def consultar_ruc(ruc: str):
         )
 
         page = await context.new_page()
-
-        # Ocultar propiedad navigator.webdriver
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
+        # Captura de datos en red como respaldo
+        api_data = {}
+
+        async def intercept_response(response):
+            if "Establecimiento/consultarPorNumeroRuc" in response.url:
+                try:
+                    res_json = await response.json()
+                    if isinstance(res_json, list) and len(res_json) > 0:
+                        api_data["establecimientos"] = res_json
+                except Exception:
+                    pass
+            elif "ConsolidadoContribuyente/existePorNumeroRuc" in response.url:
+                try:
+                    res_json = await response.json()
+                    if isinstance(res_json, dict):
+                        api_data["contribuyente"] = res_json
+                except Exception:
+                    pass
+
+        page.on("response", intercept_response)
+
         try:
-            # 1. Cargar la página
+            # 1. Cargar la página del SRI
             await page.goto(
                 "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc",
-                wait_until="networkidle",
+                wait_until="domcontentloaded",
                 timeout=30000
             )
 
-            # 2. Escribir el RUC en el input
+            # 2. Escribir RUC
             input_selector = 'input[placeholder="1700000000001"], input[id*="txtRuc"], input[type="text"]'
-            await page.wait_for_selector(input_selector, timeout=15000)
+            await page.wait_for_selector(input_selector, timeout=20000)
             await page.fill(input_selector, search_ruc)
 
-            # 3. Hacer clic en el botón "Consultar"
+            # 3. Clic en "Consultar"
             btn_consultar = page.locator('button:has-text("Consultar"), input[value="Consultar"]')
             await btn_consultar.first.click()
 
-            # Esperar a que renderice la tarjeta con la Razón Social
-            await page.wait_for_selector('text="Razón social"', timeout=15000)
+            # Validar si apareció el bloque de resultados
+            try:
+                await page.wait_for_selector('text=Razón social', timeout=15000)
+            except Exception:
+                logger.warning("No se detectó la etiqueta 'Razón social' en el tiempo estándar.")
 
-            # 4. Extraer la Razón Social
+            # 4. Extraer Razón Social desde el DOM
             razon_social = ""
-            # Buscar el bloque que contiene "Razón social" y tomar el texto continuo
-            card = page.locator('div:has-text("Razón social")')
-            if await card.count() > 0:
-                full_text = await card.first.inner_text()
-                lines = [line.strip() for line in full_text.split('\n') if line.strip()]
-                for idx, line in enumerate(lines):
-                    if "RAZÓN SOCIAL" in line.upper() and idx + 1 < len(lines):
-                        razon_social = lines[idx + 1]
-                        break
+            if "contribuyente" in api_data:
+                c_data = api_data["contribuyente"]
+                razon_social = c_data.get("razonSocial") or c_data.get("nombreCompleto") or c_data.get("nombreComercial") or ""
 
-            # 5. Hacer clic en "Mostrar establecimientos" (como en el video)
+            if not razon_social:
+                card = page.locator('div:has-text("Razón social")')
+                if await card.count() > 0:
+                    full_text = await card.first.inner_text()
+                    lines = [line.strip() for line in full_text.split('\n') if line.strip()]
+                    for idx, line in enumerate(lines):
+                        if "RAZÓN SOCIAL" in line.upper() and idx + 1 < len(lines):
+                            razon_social = lines[idx + 1]
+                            break
+
+            # 5. Clic en "Mostrar establecimientos" con reintentos
             btn_est = page.locator('button:has-text("Mostrar establecimientos")')
-            direccion = ""
-
             if await btn_est.count() > 0 and await btn_est.first.is_visible():
                 await btn_est.first.click()
-                
-                # Esperar a que la tabla "Establecimiento matriz" se cargue en pantalla
-                await page.wait_for_selector('text="Establecimiento matriz"', timeout=10000)
-                await page.wait_for_timeout(1000) # Breve pausa para asegurar el renderizado de celdas
 
-                # 6. Extraer la Ubicación del Establecimiento Abierto / Matriz
+            # 6. Esperar la tabla con selector flexible (Regex)
+            # Acepta que aparezca "Establecimiento", "MATRIZ", "ABIERTO" o la etiqueta de la tabla
+            table_found = False
+            try:
+                await page.wait_for_selector(
+                    'table, text=/Establecimiento|MATRIZ|ABIERTO/i',
+                    timeout=15000
+                )
+                table_found = True
+            except Exception:
+                logger.warning("Timeout esperando renderizado del DOM para la tabla. Verificando red...")
+
+            # 7. Extraer la Dirección
+            direccion = ""
+
+            # Intento A: Desde los datos capturados en red (Respaldo super rápido)
+            if "establecimientos" in api_data:
+                for est in api_data["establecimientos"]:
+                    if est.get("estado") == "ABI" or est.get("tipoEstablecimiento") == "MAT":
+                        prov = est.get("provincia") or ""
+                        cant = est.get("canton") or ""
+                        parr = est.get("parroquia") or ""
+                        calle = est.get("calle") or ""
+                        num = est.get("numero") or ""
+                        inter = est.get("interseccion") or ""
+
+                        parts = [p.strip() for p in [prov, cant, parr, calle, num, inter] if p and str(p).strip().upper() not in ("NONE", "NULL")]
+                        direccion = " / ".join(parts)
+                        if not direccion:
+                            direccion = str(est.get("direccionCompleta") or est.get("direccion") or "").strip()
+                        if direccion:
+                            break
+
+            # Intento B: Si la red no capturó, parsear la tabla visible en la pantalla
+            if not direccion and table_found:
                 rows = page.locator('table tr')
                 row_count = await rows.count()
                 for i in range(row_count):
@@ -90,14 +143,13 @@ async def consultar_ruc(ruc: str):
                     if "ABIERTO" in row_text.upper():
                         cols = rows.nth(i).locator('td')
                         if await cols.count() >= 3:
-                            # En la tabla del SRI, la 3ra columna (índice 2) contiene la ubicación/dirección
                             direccion = await cols.nth(2).inner_text()
                             break
 
             await browser.close()
 
-            final_name = razon_social.strip().replace('\n', ' ')
-            final_street = direccion.strip().replace('\n', ' ')
+            final_name = str(razon_social).strip().replace('\n', ' ')
+            final_street = str(direccion).strip().replace('\n', ' ')
 
             if final_name:
                 return {
@@ -112,7 +164,7 @@ async def consultar_ruc(ruc: str):
                 "ruc": search_ruc,
                 "name": "",
                 "street": "",
-                "message": "No se pudieron obtener los datos completos del contribuyente."
+                "message": "No se encontraron registros para el RUC ingresado."
             }
 
         except Exception as e:
