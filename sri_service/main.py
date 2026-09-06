@@ -1,5 +1,4 @@
 import logging
-import re
 from fastapi import FastAPI, HTTPException
 from playwright.async_api import async_playwright
 
@@ -36,56 +35,79 @@ async def consultar_ruc(ruc: str):
         page = await context.new_page()
         await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        # Captura de datos en red como respaldo
-        api_data = {}
+        api_direccion = ""
+        api_razon_social = ""
 
+        # 1. Interceptar peticiones de red (captura background de datos del SRI)
         async def intercept_response(response):
-            if "Establecimiento/consultarPorNumeroRuc" in response.url:
+            nonlocal api_direccion, api_razon_social
+            url_lower = response.url.lower()
+
+            if "establecimiento" in url_lower:
                 try:
                     res_json = await response.json()
-                    if isinstance(res_json, list) and len(res_json) > 0:
-                        api_data["establecimientos"] = res_json
+                    est_list = res_json if isinstance(res_json, list) else [res_json]
+                    
+                    for est in est_list:
+                        if isinstance(est, dict):
+                            # Construir la dirección con las partes disponibles
+                            prov = est.get("provincia") or ""
+                            cant = est.get("canton") or ""
+                            parr = est.get("parroquia") or ""
+                            calle = est.get("calle") or ""
+                            num = est.get("numero") or ""
+                            inter = est.get("interseccion") or ""
+
+                            parts = [str(p).strip() for p in [prov, cant, parr, calle, num, inter] 
+                                     if p and str(p).strip().upper() not in ("NONE", "NULL", "0")]
+                            
+                            if parts:
+                                api_direccion = " / ".join(parts)
+                                break
+                            elif est.get("direccionCompleta"):
+                                api_direccion = str(est.get("direccionCompleta")).strip()
+                                break
+                            elif est.get("direccion"):
+                                api_direccion = str(est.get("direccion")).strip()
+                                break
                 except Exception:
                     pass
-            elif "ConsolidadoContribuyente/existePorNumeroRuc" in response.url:
+
+            if "contribuyente" in url_lower:
                 try:
                     res_json = await response.json()
-                    if isinstance(res_json, dict):
-                        api_data["contribuyente"] = res_json
+                    c_data = res_json[0] if isinstance(res_json, list) and len(res_json) > 0 else res_json
+                    if isinstance(c_data, dict):
+                        api_razon_social = (
+                            c_data.get("razonSocial") or 
+                            c_data.get("nombreCompleto") or 
+                            c_data.get("nombreComercial") or ""
+                        )
                 except Exception:
                     pass
 
         page.on("response", intercept_response)
 
         try:
-            # 1. Cargar la página del SRI
+            # 2. Navegar a la página
             await page.goto(
                 "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc",
                 wait_until="domcontentloaded",
                 timeout=30000
             )
 
-            # 2. Escribir RUC
+            # 3. Llenar e ingresar RUC
             input_selector = 'input[placeholder="1700000000001"], input[id*="txtRuc"], input[type="text"]'
             await page.wait_for_selector(input_selector, timeout=20000)
             await page.fill(input_selector, search_ruc)
 
-            # 3. Clic en "Consultar"
             btn_consultar = page.locator('button:has-text("Consultar"), input[value="Consultar"]')
             await btn_consultar.first.click()
 
-            # Validar si apareció el bloque de resultados
-            try:
-                await page.wait_for_selector('text=Razón social', timeout=15000)
-            except Exception:
-                logger.warning("No se detectó la etiqueta 'Razón social' en el tiempo estándar.")
+            await page.wait_for_selector('text=Razón social', timeout=15000)
 
-            # 4. Extraer Razón Social desde el DOM
-            razon_social = ""
-            if "contribuyente" in api_data:
-                c_data = api_data["contribuyente"]
-                razon_social = c_data.get("razonSocial") or c_data.get("nombreCompleto") or c_data.get("nombreComercial") or ""
-
+            # 4. Extraer Razón Social del DOM si la red no lo tomó
+            razon_social = api_razon_social
             if not razon_social:
                 card = page.locator('div:has-text("Razón social")')
                 if await card.count() > 0:
@@ -96,75 +118,36 @@ async def consultar_ruc(ruc: str):
                             razon_social = lines[idx + 1]
                             break
 
-            # 5. Clic en "Mostrar establecimientos" con reintentos
+            # 5. Clic en "Mostrar establecimientos"
             btn_est = page.locator('button:has-text("Mostrar establecimientos")')
             if await btn_est.count() > 0 and await btn_est.first.is_visible():
                 await btn_est.first.click()
+                await page.wait_for_timeout(2000)  # Dar tiempo a que cargue la tabla y la red
 
-            # 6. Esperar la tabla con selector flexible (Regex)
-            # Acepta que aparezca "Establecimiento", "MATRIZ", "ABIERTO" o la etiqueta de la tabla
-            table_found = False
-            try:
-                await page.wait_for_selector(
-                    'table, text=/Establecimiento|MATRIZ|ABIERTO/i',
-                    timeout=15000
-                )
-                table_found = True
-            except Exception:
-                logger.warning("Timeout esperando renderizado del DOM para la tabla. Verificando red...")
-
-            # 7. Extraer la Dirección
-            direccion = ""
-
-            # Intento A: Desde los datos capturados en red (Respaldo super rápido)
-            if "establecimientos" in api_data:
-                for est in api_data["establecimientos"]:
-                    if est.get("estado") == "ABI" or est.get("tipoEstablecimiento") == "MAT":
-                        prov = est.get("provincia") or ""
-                        cant = est.get("canton") or ""
-                        parr = est.get("parroquia") or ""
-                        calle = est.get("calle") or ""
-                        num = est.get("numero") or ""
-                        inter = est.get("interseccion") or ""
-
-                        parts = [p.strip() for p in [prov, cant, parr, calle, num, inter] if p and str(p).strip().upper() not in ("NONE", "NULL")]
-                        direccion = " / ".join(parts)
-                        if not direccion:
-                            direccion = str(est.get("direccionCompleta") or est.get("direccion") or "").strip()
-                        if direccion:
-                            break
-
-            # Intento B: Si la red no capturó, parsear la tabla visible en la pantalla
-            if not direccion and table_found:
-                rows = page.locator('table tr')
-                row_count = await rows.count()
-                for i in range(row_count):
-                    row_text = await rows.nth(i).inner_text()
-                    if "ABIERTO" in row_text.upper():
-                        cols = rows.nth(i).locator('td')
-                        if await cols.count() >= 3:
-                            direccion = await cols.nth(2).inner_text()
-                            break
+            # 6. Extraer Dirección de la tabla en el DOM si la red falló
+            direccion_dom = api_direccion
+            if not direccion_dom:
+                # Buscar todas las celdas de las tablas que contengan la provincia/ciudad (en mayúsculas con comarcas)
+                cells = page.locator('table tr td')
+                cell_count = await cells.count()
+                for i in range(cell_count):
+                    text = await cells.nth(i).inner_text()
+                    text_clean = text.strip()
+                    # Las direcciones en el SRI contienen barras `/` separando provincia / cantón / parroquia / calle
+                    if "/" in text_clean and len(text_clean) > 10:
+                        direccion_dom = text_clean
+                        break
 
             await browser.close()
 
             final_name = str(razon_social).strip().replace('\n', ' ')
-            final_street = str(direccion).strip().replace('\n', ' ')
-
-            if final_name:
-                return {
-                    "success": True,
-                    "ruc": search_ruc,
-                    "name": final_name,
-                    "street": final_street
-                }
+            final_street = str(direccion_dom).strip().replace('\n', ' ')
 
             return {
-                "success": False,
+                "success": True,
                 "ruc": search_ruc,
-                "name": "",
-                "street": "",
-                "message": "No se encontraron registros para el RUC ingresado."
+                "name": final_name,
+                "street": final_street
             }
 
         except Exception as e:
