@@ -12,25 +12,27 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "es-EC,es;q=0.9",
+    "Origin": "https://srienlinea.sri.gob.ec",
     "Referer": "https://srienlinea.sri.gob.ec/sri-en-linea/SriRucWeb/ConsultaRuc/Consultas/consultaRuc"
 }
 
-SRI_BASE_URL = "https://srienlinea.sri.gob.ec/sri-catastro-sujeto-pasivo-servicio-internet/rest"
+# URL corregida (sin 'pasivo')
+SRI_BASE_URL = "https://srienlinea.sri.gob.ec/sri-catastro-sujeto-servicio-internet/rest"
 
 @app.get("/consultar/{ruc}")
 async def consultar_ruc(ruc: str):
     clean_ruc = str(ruc).strip()
     if len(clean_ruc) not in (10, 13):
-        raise HTTPException(status_code=400, detail="Identificación inválida (debe tener 10 o 13 dígitos)")
+        raise HTTPException(status_code=400, detail="Identificación inválida (10 o 13 dígitos)")
 
     search_ruc = clean_ruc if len(clean_ruc) == 13 else f"{clean_ruc}001"
 
-    url_contribuyente = f"{SRI_BASE_URL}/ConsolidadoContribuyente/existePorNumeroRuc?numeroRuc={search_ruc}"
+    # Endpoints REST directos del SRI
+    url_contribuyente = f"{SRI_BASE_URL}/ConsolidadoContribuyente/obtenerPorNumerosRuc?ruc={search_ruc}"
     url_establecimiento = f"{SRI_BASE_URL}/Establecimiento/consultarPorNumeroRuc?numeroRuc={search_ruc}"
 
-    async with httpx.AsyncClient(headers=HEADERS, timeout=8.0, verify=False) as client:
+    async with httpx.AsyncClient(headers=HEADERS, timeout=10.0, verify=False) as client:
         try:
-            # Uso correcto de asyncio.gather para concurrencia
             res_contrib, res_estab = await asyncio.gather(
                 client.get(url_contribuyente),
                 client.get(url_establecimiento),
@@ -40,7 +42,7 @@ async def consultar_ruc(ruc: str):
             name = ""
             street = ""
 
-            # 1. Procesar Razón Social / Nombre
+            # 1. Extraer Razón Social / Nombre Completo
             if isinstance(res_contrib, httpx.Response) and res_contrib.status_code == 200:
                 data_c = res_contrib.json()
                 if isinstance(data_c, list) and len(data_c) > 0:
@@ -52,7 +54,7 @@ async def consultar_ruc(ruc: str):
                         data_c.get("nombreComercial") or ""
                     ).strip()
 
-            # 2. Procesar Dirección Matriz
+            # 2. Extraer Dirección (Establecimiento Matriz)
             if isinstance(res_estab, httpx.Response) and res_estab.status_code == 200:
                 data_e = res_estab.json()
                 est_list = data_e if isinstance(data_e, list) else [data_e]
@@ -82,7 +84,7 @@ async def consultar_ruc(ruc: str):
                     "ruc": search_ruc,
                     "name": "",
                     "street": "",
-                    "message": "No se encontraron datos para la identificación ingresada"
+                    "message": "No se encontraron registros para la identificación."
                 }
 
             return {
@@ -93,11 +95,11 @@ async def consultar_ruc(ruc: str):
             }
 
         except Exception as e:
-            logger.error(f"Error consultando SRI API REST para {search_ruc}: {str(e)}")
+            logger.error(f"Error procesando RUC {search_ruc}: {str(e)}")
             return {
                 "success": False,
                 "ruc": search_ruc,
                 "name": "",
                 "street": "",
-                "message": f"Error de conexión con el SRI: {str(e)}"
+                "message": f"Error de comunicación con el SRI: {str(e)}"
             }
